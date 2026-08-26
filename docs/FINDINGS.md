@@ -79,3 +79,51 @@ detour path through the L-joint is taken.
 Room B accessible only via room A (not by cutting across the shared wall corner):
 measured path > 14 m vs. straight-line ≈ 13.45 m. Confirms room-id node keys
 prevent shared polygon corners from acting as inter-room bridges.
+
+---
+
+## 2026-08-26 — Reward function skeleton (Day 6-7 work, pulled forward)
+
+### Module written
+- `rlvr/reward.py` — `compute_reward(plan) -> dict`
+  Hard gate (geometry_gate + topology + no_rooms) → R = −1.
+  Statutory score R_code from corridor, door, egress margins.
+  Quality score Q (area-weighted isoperimetric compactness, PLACEHOLDER).
+  Full formula: R(y) = M * C_all + R_code + β * Q.
+
+### Test suite results
+10 tests in `rlvr/tests/test_reward.py` — **10 passed, 0 failed**.
+Combined suite (verifiers + reward): **69 passed, 0 failed**
+(pytest 9.1.1, Python 3.13.3, Shapely 2.1.2).
+
+| File | Tests | Result |
+|------|-------|--------|
+| test_reward.py | 10 | all pass |
+| (verifier tests unchanged) | 59 | all pass |
+
+### M-dominance: empirical gap on test plans
+
+Training constants: w_k=1/3, lam=0.5, M=2.0, beta=0.1
+
+| Plan | Reward |
+|------|--------|
+| COMPLIANT (corridor 1.2 m, doors 0.9 m) | 3.0756 |
+| BORDERLINE (corridor 0.91 m, doors 0.81 m) | 3.0754 |
+| NO_CORRIDOR (no corridor rooms, doors 0.9 m) | 3.0785 |
+| SINGLE_VIOLATION (corridor 0.80 m) | 0.7235 |
+| MISSING_CLEARWIDTH (door ERROR record) | 0.5756 |
+| MULTI_VIOLATION (corridor 0.80 m + doors 0.75 m) | 0.3798 |
+
+**min compliant = 3.0754, max violating = 0.7235, gap = 2.3518**
+
+The algebraic lower bound on the gap is ~2.233 (M + 1 − 2/3 − β).
+The empirical gap (2.3518) exceeds this, confirming Q(y) does not cause any
+violating plan to approach the compliant floor.  If training plans ever produce
+a gap near zero, revisit M or β.
+
+### Known edge cases not covered by tests
+- A plan where egress returns ERROR after topology passes (extreme within-room
+  concavity disconnecting the waypoint graph).  This case is handled by the
+  ERROR-as-FAIL path in reward.py but is not yet exercised by a specific fixture.
+  The MISSING_CLEARWIDTH test exercises the ERROR-as-FAIL path via door.check.
+- Plans with no openings at all (would fail topology gate before reaching R_code).
