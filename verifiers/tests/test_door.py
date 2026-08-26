@@ -20,7 +20,7 @@ def test_canonical_pass():
     result = check(_plan(_door("d1", clear_width=0.90)))[0]
     assert result["status"] == "PASS"
     assert result["measured_value"] == 0.90
-    assert result["margin"] == pytest.approx(0.10)
+    assert result["margin"] == pytest.approx(0.125)  # (0.90 - 0.80) / 0.80
 
 
 def test_canonical_fail():

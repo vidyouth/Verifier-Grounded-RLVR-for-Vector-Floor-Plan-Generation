@@ -15,6 +15,7 @@ from shapely.geometry import LineString, Polygon
 # PLACEHOLDER — generic threshold, not a real jurisdiction (see LIMITATIONS.md)
 _MIN_WIDTH_M: float = 0.90
 _CLAUSE_ID: str = "CORR-W-01"
+_EPS: float = 1e-9  # margin denominator floor
 
 # Exactly "corridor" only; aliases (hallway, hall, passage) deferred to Day 3
 # when real RPLAN type labels are confirmed — see DECISIONS.md 2026-08-26.
@@ -64,7 +65,7 @@ def check(plan: dict) -> list[dict]:
             })
             continue
         width = _min_clear_width(poly)
-        margin = round(width - _MIN_WIDTH_M, 6)
+        margin = round((width - _MIN_WIDTH_M) / max(abs(_MIN_WIDTH_M), _EPS), 6)
         results.append({
             "clause_id": _CLAUSE_ID,
             "room_id": rid,

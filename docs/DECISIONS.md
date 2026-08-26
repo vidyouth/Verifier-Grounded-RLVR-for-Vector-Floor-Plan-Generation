@@ -45,3 +45,46 @@ its own edges whose normals naturally sample across that arm.
 Shapely normalises all Polygon exterior rings to CCW orientation, so the inward normal
 is always the left-hand perpendicular of each directed edge — no per-polygon orientation
 check required.
+
+---
+
+## 2026-08-26 — Day 2: Topology + Egress verifiers
+
+### Placeholder threshold: egress maximum travel distance
+- **Egress maximum travel distance: 30.0 m** (PLACEHOLDER — generic code, not a real jurisdiction)
+Round number plausible for residential egress. Not taken from any code body.
+Clause ID: EGR-D-01.
+
+### Egress reference point: polygon vertices, take max
+The "egress distance" of a room is defined as the maximum shortest-path distance
+from the building entrance to any polygon vertex of that room. All vertices are
+measured, and the worst-case is reported. For convex rooms this is exact; for
+concave rooms it is an approximation (the worst-case point may not be at a vertex
+if the room has significant concavity away from vertices). See LIMITATIONS.md.
+
+### Egress graph: room-id-based node keys
+Within-room graph nodes are keyed by `("rv", room_id, vertex_index)` for room
+vertices and `("dm", door_id, room_id)` for door midpoints. This prevents shared
+polygon corners (e.g., a wall corner that two rooms share) from acting as implicit
+inter-room bridges. Only door midpoints serve as gateways between rooms.
+
+Rejected alternative — raw coordinate tuples as keys: two rooms sharing a wall
+corner would produce the same coordinate key, creating an implicit passage without
+a door. Room-id keys make crossing explicit.
+
+### Within-room visibility: Shapely covers() filter
+A within-room edge between two local nodes (polygon vertices or door midpoints) is
+only added to the graph when `poly.covers(LineString([a, b]))` is True — i.e., the
+entire segment lies within (or on the boundary of) the room polygon. This blocks
+shortcuts through concave notches in L-shaped or non-convex rooms.
+
+Residual approximation: within-room paths are modelled as straight-line segments
+between waypoints. For rooms with significant concavity, some vertex pairs may not
+be directly visible from the door midpoint even along the polygon boundary; those
+vertices would be reported as unreachable. See LIMITATIONS.md.
+
+### Dijkstra with integer tiebreaker
+Python's `heapq` cannot compare tuples against strings (the entrance node is the
+string `"entrance"`; room-vertex nodes are tuples). A monotonically-increasing
+integer counter is inserted as the second heap element to break distance ties
+without ever comparing node keys directly.

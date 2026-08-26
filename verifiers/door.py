@@ -12,6 +12,7 @@ from __future__ import annotations
 # PLACEHOLDER — generic threshold, not a real jurisdiction (see LIMITATIONS.md)
 _MIN_WIDTH_M: float = 0.80
 _CLAUSE_ID: str = "DOOR-W-01"
+_EPS: float = 1e-9  # margin denominator floor
 
 
 def check(plan: dict) -> list[dict]:
@@ -63,13 +64,13 @@ def check(plan: dict) -> list[dict]:
                 "opening_id": oid,
                 "measured_value": cw,
                 "threshold": _MIN_WIDTH_M,
-                "margin": round(cw - _MIN_WIDTH_M, 6),
+                "margin": round((cw - _MIN_WIDTH_M) / max(abs(_MIN_WIDTH_M), _EPS), 6),
                 "status": "FAIL",
                 "detail": "zero or negative clear_width",
             })
             continue
 
-        margin = round(cw - _MIN_WIDTH_M, 6)
+        margin = round((cw - _MIN_WIDTH_M) / max(abs(_MIN_WIDTH_M), _EPS), 6)
         results.append({
             "clause_id": _CLAUSE_ID,
             "opening_id": oid,
