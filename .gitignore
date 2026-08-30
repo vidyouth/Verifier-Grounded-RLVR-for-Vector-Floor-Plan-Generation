@@ -6,3 +6,20 @@ __pycache__/
 dist/
 build/
 .env
+
+# Claude Code local (machine-specific) settings
+.claude/settings.local.json
+
+# --- Raw datasets: do NOT commit (CC BY 4.0 data, large) ---
+# ResPlan raw dataset — download instructions in data/raw/PROVENANCE.md
+data/raw/ResPlan.pkl
+data/raw/ResPlan.zip
+data/raw/ResPlan.pkl.*
+# Any locally-derived / normalized dataset artifacts
+data/processed/
+data/*.pkl
+data/*.npz
+# Kept in git (small, needed for reproducibility / attribution):
+#   data/raw/split.json, data/raw/croissant.json, data/raw/LICENSE.upstream,
+#   data/raw/README.upstream.md, data/raw/TAKEDOWN.md, data/raw/resplan_utils.py,
+#   data/raw/PROVENANCE.md

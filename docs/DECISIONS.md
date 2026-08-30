@@ -4,6 +4,166 @@ Dated log of every design choice and the reasoning behind it.
 
 ---
 
+## 2026-08-30 — Day 3: data source switched from RPLAN to ResPlan
+
+### Decision
+The training/eval data source is now **ResPlan** (https://github.com/m-agour/ResPlan,
+17,000 residential vector floor plans, CC BY 4.0), not RPLAN / the Lara et al.
+data as written in EXECUTION_PLAN.md (Day 3) and CLAUDE.md.
+
+### Reason
+The RPLAN access request (required to obtain the Lara et al. / RPLAN JSON) has not
+resolved, and this is a solo project on a fixed 8-day timeline with Day 3 being the
+data-prep day. Waiting is not an option without slipping SFT (Day 4-5) and GRPO
+(Day 6-7). ResPlan is an open, immediately-downloadable, vector-native dataset in
+the same scope (single-floor residential, South-Asian listings, metric geometry,
+room-connectivity graph, canonical splits). It is the closest drop-in available
+now.
+
+### Consequences / follow-ups
+- **Results are no longer directly comparable to the Lara et al. paper this project
+  extends.** Logged as a LIMITATIONS.md entry (2026-08-30).
+- ResPlan is geometry, not our JSON schema. A conversion/normalization pipeline is
+  required (Day 3 phase B). Phase A (this entry's session) was read-only dataset
+  inspection — findings in FINDINGS.md 2026-08-30.
+- **No corridor / hallway / circulation room type exists in ResPlan.** Room types
+  are: living, bedroom, bathroom, kitchen, balcony, storage, stair (+ outdoor:
+  garden, parking, pool). The CORR-W-01 clause (minimum corridor clear width) will
+  therefore have **zero applicable records on every converted plan** and will
+  always take the reward function's "vacuous clause pass" path (c_k=1, s_k=0).
+  Decision on how to handle this (drop the clause to a 2-clause project, synthesize
+  circulation space from leftover inner area, or keep it as a documented no-op) is
+  DEFERRED to Day 3 phase B — flagged for review, not decided here.
+- **Doors and windows carry no room/wall references** in ResPlan (they are bare
+  rectangle polygons). Our schema's `host_wall: [room_a, room_b]` field must be
+  reconstructed geometrically during conversion (buffer each opening, test which
+  room polygons it bridges — the approach `resplan_utils.plan_to_graph` uses).
+- **Coordinates are not metres** despite the upstream README's claim. They sit in a
+  ~256-unit normalized canvas; per-plan scale is recoverable as
+  `sqrt(inner_polygon_area / plan["area"])` ≈ 18.3 canvas units/m. Normalization
+  must derive and apply this per plan.
+- Split strategy: ResPlan ships a canonical plan-level `split.json`
+  (13053/1632/1632 + 683 augmented). It has **no parent-building / listing identity
+  field**, so the EXECUTION_PLAN "split by parent building" cannot use a
+  dataset-provided grouping. Options (adopt ResPlan's canonical split as-is vs.
+  re-dedup geometrically and re-split) DEFERRED to phase B.
+
+### Attribution (CC BY 4.0) — noted, not yet added
+Where the ResPlan attribution notice must go is recorded in
+`data/raw/PROVENANCE.md`. Not added to README/paper yet (repo has no top-level
+README section for data yet).
+
+---
+
+## 2026-08-30 — Day 3 phase B: ResPlan → schema conversion pipeline
+
+Pipeline built in `data/` (`convert.py`, `dedup_split.py`, `run.py`, tests).
+`convert_plan` is a pure function: one raw ResPlan dict → project-schema JSON or
+`(None, reason)`. Verifier files were NOT modified. End-to-end result:
+**13,485 / 17,000 plans converted, 100% pass `geometry_gate`** (numbers in
+FINDINGS.md 2026-08-30).
+
+### Exclusion filters (applied first)
+1. **Drop any plan containing a `stair` polygon** — implies multiple floors,
+   which conflicts with the locked single-floor scope. (−685 plans.)
+2. **Room-count scope filter, 5–8, counting `living + bedroom + bathroom +
+   kitchen + storage` polygons only.** Balconies are excluded from the count
+   (they inflate counts and are semi-outdoor) but balcony geometry is still
+   converted and emitted as `type: "balcony"` rooms. `stair` never counts (it is
+   an exclusion trigger). (−1,958 plans; 14,357 survive both filters.)
+
+### Coordinate normalization
+Per plan: `scale = sqrt(inner_polygon_area_canvas / plan["area"])` (canvas units
+per metre; ResPlan coords are a ~256-unit canvas, not metres). Every coordinate
+is divided by `scale` and translated so the boundary-bbox min sits at the origin.
+`plan["area"]` (m²) is the ground truth; `net_area` is confirmed unreliable and
+unused. `wall_depth` is converted the same way (~0.23 m typical).
+
+### host_wall reconstruction + per-opening midline gap-close
+ResPlan openings carry no room/wall references, and adjacent rooms sit ~0.16 m
+apart across the wall band (no shared boundary to host an opening on).
+- **Host resolution:** buffer each door/window/front_door polygon by
+  `0.6 × wall_depth` and take the ≤2 rooms with the largest buffered-overlap
+  area (deterministic: area desc, then id). ~98% of doors resolve to exactly 2
+  rooms. 1 room → exterior opening `["exterior", room]`; front_door →
+  `["exterior", room]`; 0 rooms → opening dropped.
+- **Local per-door midline gap-close:** for each interior opening, a thin patch
+  is unioned into each host room out to the gap midline, creating a short real
+  shared boundary segment spanning the opening. Each patch has `boundary.buffer(
+  _MAX_GAP_CLOSE_M)` intersected and **all existing room area subtracted**, so it
+  can only ever fill previously-unoccupied wall-gap space — it cannot create a
+  new room overlap. Applied only where the rooms are ≤ 1.0 m apart
+  (`_MAX_GAP_CLOSE_M`, ≈ 4 wall thicknesses); wider openings are left as-is.
+- **Two-pass ordering:** all gap-closes + room-polygon mop-up (overlap scrub,
+  ring cleanup, coordinate rounding to 1e-6 m) run first; opening **endpoints are
+  projected onto the FINAL polygons afterwards** — onto the shared segment
+  between the two host rooms when it exists, else onto `host_wall[0]`'s edge.
+  This guarantees endpoints land exactly on a host-wall edge (geometry_gate) and,
+  via the shared segment, puts the opening midpoint on both rooms so egress's
+  `covers()` filter connects from either side. No change to `geometry_gate.py`.
+
+### Interior openings emitted as `door` regardless of ResPlan's trace
+Any opening resolving to two rooms is emitted as `type: "door"` even if ResPlan
+labelled it a window. Genuine interior windows are rare and ResPlan mislabels
+many interior doors / open passages as windows (upstream `resplan_utils.py`
+performs the same `via_window → via_door` promotion). The opening id keeps its
+`window_*` prefix for traceability. Exterior windows (one host room) stay
+`type: "window"`. Rationale: topology / egress must see the real circulation;
+without this, open-plan kitchens (very common in ResPlan) are unreachable.
+
+### Room-overlap fix
+~13% of in-scope plans have a room-pair tracing-artefact overlap. Fix: the
+**smaller-area room yields** the overlap region (`difference`), iterated to a
+fixed point, with a final sub-micron "dust scrub" so the result clears
+`geometry_gate`'s 1e-9 m² tolerance after coordinate rounding. **Drop the plan**
+if any raw room pair overlaps by > 0.5 m² (`room_overlap_large`, −753) or if a
+residual overlap survives the fix (`room_overlap_residual`, −2).
+
+### Corridor synthesis — ABANDONED (hard-stop condition met)
+Confirmed with the user 2026-08-30. The residual-interior-area method produces
+the inter-room wall-gap web (fill ratio ≈ 0.10, bbox spanning the whole plan),
+not corridor-shaped polygons, on essentially every plan — ResPlan rooms tile the
+floor plate wall-to-wall with no architect-authored circulation space. **No room
+is ever emitted with `type: "corridor"`.** `corridor.check` returns `[]` on every
+converted plan and CORR-W-01 is a vacuous pass (`c_k=1, s_k=0`) in the reward for
+this dataset. Logged as a result in FINDINGS.md and a caveat in LIMITATIONS.md.
+
+### relations / audit schema (per the actual PROJECT_CONTEXT.md spec, supplied by user)
+- `relations: {"derived": [...]}` — one entry per interior door
+  (`{"type": "via_door", "rooms": [a, b]}`) and per front/exterior door
+  (`{"type": "direct", "rooms": ["exterior", r]}`). Built from **via_door +
+  front-door-direct only** — never via_window, adjacency, or fallback. No
+  `"requested"` key (generation-task only).
+- `audit: []` — inert placeholder; verifiers are pure functions that return their
+  own records and never write back into the plan.
+
+### Topology-relevant edges: via_door + direct only
+`topology.py` / `egress.py` consume the plan's `openings[].host_wall`, which this
+pipeline populates only from `door`-typed openings (incl. promoted interior
+windows) and the front door. ResPlan `adjacency` / `via_opening` / `via_window`
+(exterior) / `fallback` relations are never turned into walkable connections.
+Consequence: ~20% of converted plans have a room (almost always an open-plan
+kitchen) reachable in ResPlan only through an unwalled opening with no connector
+polygon; those fail `topology` and hard-gate in the reward. This is the honest
+ceiling of the "via_door + direct only" rule on this dataset — reported in
+FINDINGS.md, not worked around.
+
+### Dedup + cluster-level split (canonical split.json NOT used)
+- **Augmented ↔ origin link:** exact hash of the raw `inner` polygon vertices
+  rounded to 0.1 canvas units (matched 667/683 in phase A).
+- **Near-duplicate originals:** bucket on `(area 0.5 m², inner-bbox W/H 0.25 m,
+  room count, bedroom count)`, then link a pair when IoU of the origin-aligned
+  room-union ≥ **0.90**. Union-Find over both link types → clusters.
+- **Split:** whole clusters assigned to train/val/test, greedily filling toward
+  80/10/10 **by plan count** (largest clusters first). No cluster spans two
+  splits. Result: 12,757 clusters (697 multi-plan), split
+  10,788 / 1,349 / 1,348.
+
+### Coordinate output precision
+Room/boundary coordinates are rounded to 6 dp (1e-6 m). The overlap scrub uses a
+`buffer(1e-6)` bite specifically so its cut survives that rounding (which can
+shift a vertex up to 5e-7 m).
+
 ## 2026-08-26 — Day 1: Verifier bank v1
 
 ### Geometry library: Shapely
