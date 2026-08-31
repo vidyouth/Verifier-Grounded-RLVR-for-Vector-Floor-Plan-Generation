@@ -79,6 +79,31 @@ The worst converted room has ~435 vertices (`data/samples/sample_jagged_polygon_
 id4296.json`). Verifiers produce correct results but `egress` is O(V²); a
 vertex-count cap or simplification before egress is advisable at scale.
 
+## SFT limitations (added 2026-08-31, Day 4-5)
+
+- **Base model downgraded to 1.5B.** Per PROJECT_CONTEXT.md §3 the T4 free tier
+  cannot train a 7-8B QLoRA in scope, so the policy is Qwen2.5-1.5B-Instruct
+  (logged decision, DECISIONS.md 2026-08-31). Any generation-quality ceiling
+  from model size applies to every downstream result (SFT and GRPO).
+- **`max_seq_len = 3072` drops the long tail of plans.** ~8-9% of in-scope train
+  plans exceed the budget and are dropped (not truncated). These skew toward the
+  largest / most jagged-contour layouts, so the SFT model is trained on the
+  smaller-plan end of the 5-8-room distribution. Same cap applies at eval-time
+  generation.
+- **`metadata`, `relations`, `audit` are not model outputs.** They are templated
+  or derived from `openings` after generation. The SFT model is never evaluated
+  on its ability to produce them, and any downstream "schema completeness" claim
+  must note that these keys are supplied by the pipeline, not the model.
+- **JSON-validity rate is for greedy decoding.** The Day 4-5 headline metric uses
+  deterministic `do_sample=False` decoding. Sampling (as used in GRPO rollouts)
+  will produce a different, generally lower, raw-validity rate.
+- **Coordinates carried at 6-dp metres.** Completions reproduce the converter's
+  full-precision coordinates; this is token-expensive and inflates sequence
+  length (hence the drop rate above). Not reduced because coarser rounding
+  breaks `geometry_gate`'s endpoint-on-wall tolerance in the training targets.
+- **CORR-W-01 remains vacuous** on this data (inherited from the ResPlan
+  conversion — see above). SFT does not change that.
+
 ## Within-room convexity approximation (egress.py)
 
 The egress verifier models within-room travel as straight-line segments between

@@ -1,0 +1,16 @@
+# SFT (Day 4-5) — QLoRA fine-tune of Qwen2.5-1.5B-Instruct on a Colab T4.
+#
+# Pinned to a coherent, known-good set for Turing (T4) + 4-bit QLoRA. These are
+# deliberately not "latest": trl / transformers SFT APIs churn, and this script
+# is meant to be kicked off and left alone. Bump only with a test run + a
+# DECISIONS.md note. torch is whatever Colab preinstalls (CUDA build) — do NOT
+# reinstall it here.
+#
+# This project's own code needs only `shapely` (already used by data/ + verifiers/).
+
+transformers==4.46.3
+peft==0.13.2
+bitsandbytes==0.44.1
+accelerate==1.1.1
+datasets==3.1.0
+shapely>=2.0

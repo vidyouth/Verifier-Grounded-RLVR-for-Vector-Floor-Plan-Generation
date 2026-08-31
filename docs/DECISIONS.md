@@ -4,6 +4,131 @@ Dated log of every design choice and the reasoning behind it.
 
 ---
 
+## 2026-08-31 — Day 4-5: SFT (QLoRA) — data split, base model, hyperparameters
+
+### PROJECT_CONTEXT.md committed to the repo
+It was referenced across `DECISIONS.md` / `FINDINGS.md` / `reward.py` /
+`egress.py` as "the spec, supplied by user" but had never been committed. The
+user supplied the canonical text this session; it is now `docs/PROJECT_CONTEXT.md`
+verbatim. All Day 4-5 work is against it (§2 schema, §2 reward, §3 constraints).
+
+### Base model: Qwen2.5-1.5B-Instruct (explicit downgrade, per PROJECT_CONTEXT §3)
+PROJECT_CONTEXT.md §3 requires the "7-8B may not fit the T4 → fall back to 1-3B"
+call to be **made explicitly and logged, not silently downgraded**. Decision:
+use **Qwen2.5-1.5B-Instruct** as the SFT (and later GRPO reference) base.
+Reasoning: (a) a 7-8B QLoRA forward/backward at seq-len 3072 will not fit a
+free-tier T4 (16 GB) alongside optimizer state without offload gymnastics that
+blow the 12 hr session budget; (b) 1.5B in 4-bit NF4 is ~1.1 GB of weights,
+leaving comfortable headroom for fp16 activations + LoRA + paged optimizer;
+(c) Qwen2.5-1.5B-Instruct has strong structured-output behaviour and a 32k
+context, and the task is a *distribution shift* (emit one JSON dialect), not a
+new capability, so a small model is a reasonable policy to start GRPO from;
+(d) it trains 3 epochs on ~10k plans in ~1 hr of T4 compute — fits one session
+with checkpoint safety. 3B (Qwen2.5-3B) remains a fallback-of-the-fallback if
+SFT JSON-validity is poor; that would itself be a logged decision.
+
+### Prompt / completion split
+- **Prompt** (inside a Qwen chat `user` turn, compact JSON):
+  `{"boundary": {"polygon", "entrance"}, "rooms": [{"type", "target_area"}]}`.
+  `target_area` is the PROJECT_CONTEXT §2 schema field ("rooms (id, type,
+  polygon, target area)"); the ResPlan converter does not emit it, so it is
+  recomputed per room as `round(Polygon(room.polygon).area, 1)` m². Room order
+  follows `data/convert.py`'s `_ROOM_KEYS` so prompt order == converted-plan
+  order.
+- **Completion**: `{"boundary" (echoed), "rooms": [{"id","type","polygon"}],
+  "openings": [{"id","type","host_wall","endpoints","clear_width","swing"}]}`.
+- **Not generated — templated / derived after generation** (`sft/plan_prompt.py`):
+  - `metadata`: fixed boilerplate (schema version, units=meters, jurisdiction
+    placeholder tag, occupancy=residential). Not worth model capacity.
+  - `relations.derived`: fully determined by `openings` — one entry per
+    door-typed opening (`direct` if it meets `exterior`, else `via_door`),
+    identical rule to `data/convert.py`. Confirmed with user: **drop from the
+    completion, rebuild post-gen**. Verified reproduces the converter's own
+    `relations.derived` exactly on 401/401 val plans.
+  - `audit`: always `[]` in a generated plan; verifiers are pure and return
+    their own records.
+- Coordinates kept at the converter's 6-dp metres **verbatim** — not rounded to
+  save tokens. Rounding the training targets to <6 dp would break
+  `geometry_gate`'s 1e-6 m endpoint-on-host-wall tolerance and teach the model
+  geometry that fails the gate. Logged as a token-cost limitation instead.
+
+### max_seq_len = 3072 (confirmed with user)
+Estimated full-sequence token lengths (chars/2.8 heuristic, exact figure computed
+in Colab by `prepare_sft_data.py --tokenizer`): train p50 ≈ 2305, p90 ≈ 2965,
+p99 ≈ 3583. 3072 covers ~p91-92; the ~8-9% of train plans over budget are
+**dropped, not truncated** (a truncated completion is invalid JSON and poisons
+the signal). 4096 (covers ~p99) was the alternative — rejected for slower steps
+and tighter T4 VRAM. Consequence (LIMITATIONS): SFT sees the smaller-plan end of
+the in-scope distribution.
+
+### LoRA config
+`r=16, alpha=32 (2·r), dropout=0.05`, `target_modules = [q,k,v,o,gate,up,down]_proj`
+(all attention + MLP projections — the standard QLoRA "all-linear" recipe).
+Reasoning: r=16 is the common sweet spot for sub-3B QLoRA (~18M trainable,
+~1.1% of params); emitting one JSON dialect is a moderate shift, so r=8 risks
+underfitting the coordinate patterns and r=32/64 buys little for the VRAM/time.
+dropout 0.05 is light regularization for ~10k examples × 3 epochs.
+
+### Optimisation
+`lr=2e-4` (canonical QLoRA LR), `cosine` schedule, `warmup_ratio=0.03`,
+`weight_decay=0.0`, `max_grad_norm=0.3` (QLoRA-paper default; guards fp16 spikes),
+`optim=paged_adamw_8bit` (keeps optimizer state off the critical VRAM path).
+`per_device_batch_size=1`, `grad_accum=16` → **effective batch 16**
+(batch=1 forced by seq-len 3072 on a T4; effective 16 with lr 2e-4 is
+well-trodden). `num_train_epochs=3` (~1,875 steps): 1 underfits structured
+output, 5+ risks memorising coordinates. `fp16=True` (T4 has no bf16).
+`gradient_checkpointing=True` (use_reentrant=False). `group_by_length=True` to
+cut pad waste. `seed=42`.
+
+### Completion-only loss
+Prompt tokens are masked to `-100`; loss is on the completion + EOS only.
+Standard for instruction SFT — don't spend gradient on reproducing the prompt.
+Implemented with a custom collator + `transformers.Trainer` (not `trl.SFTTrainer`
+— trl's SFT API churns release-to-release and this script must "kick off and be
+left alone"; plain `Trainer` gives stable native `resume_from_checkpoint`).
+
+### Checkpoint / resume
+Checkpoint to Google Drive on **wall-clock interval, default 15 min** (a
+`TrainerCallback` flips `control.should_save`), with `save_steps=200` as a floor
+and `save_total_limit=3`. On launch the script scans `output_dir` for the
+highest `checkpoint-N` with a `trainer_state.json` and passes it to
+`trainer.train(resume_from_checkpoint=…)` — re-running the identical command is
+the only recovery step. Deps pinned in `sft/requirements.txt` (not "latest").
+
+### JSON-validity eval: deterministic greedy decoding
+`do_sample=False, num_beams=1`. The headline metric is the **strict `json.loads`
+rate** on the raw generation over all 1,349 val plans (EXECUTION_PLAN Day 4-5).
+Secondary, non-blocking: `geometry_gate` pass rate after reassembly (templated
+metadata + derived relations). Greedy so the number is reproducible; a sampling
+temperature will move it (LIMITATIONS). Results written per-plan and resumable.
+Full clause-compliance eval is explicitly deferred to Day 6-7/8.
+
+### max_seq_len drop-rate refinement
+Initial off-the-cuff guess was ~7% of train plans over the 3072 budget. The
+char-length measurement (chars ÷ 2.8 heuristic) puts it at **~8-9%**. Exact
+figure is computed by `prepare_sft_data.py --tokenizer` / `train_qlora.py` on the
+real Qwen tokenizer in Colab and will be recorded in FINDINGS.md after the run.
+
+### Runtime estimate: heuristic vs. measured (calibration step added)
+The "~1 hr T4 for 3 epochs" figure is a **pre-run heuristic** and is flagged as
+optimistic: batch=1 (forced by seq-len 3072) means ~1,875 optimiser steps ≈
+30k forward-backward passes through a 1.5B model; rough FLOP math could put a
+real T4 at several hours. Rather than guess, `train_qlora.py --calibrate 50`
+runs 50 real steps, takes the **median s/step (first 5 skipped for cudnn/cache
+warmup)**, and extrapolates a full-run time (+ a 5-12% checkpoint/eval overhead
+band), writing `calibration.json`. The Colab flow runs calibration **before**
+the unattended run; the measured number goes here next to this heuristic,
+whichever way it lands. On record now:
+- **heuristic estimate:** ~1 hr for 3 epochs (~1,875 steps, assumed ~2 s/step).
+- **measured estimate:** _pending first Colab calibration._
+
+### Training run status
+**Not yet executed.** Hyperparameters confirmed by user 2026-08-31. Scripts +
+data prep + docs delivered. Next Colab session: `prepare_sft_data --tokenizer`
+→ `train_qlora --calibrate 50` → report measured runtime → full run.
+
+---
+
 ## 2026-08-30 — Day 3: data source switched from RPLAN to ResPlan
 
 ### Decision

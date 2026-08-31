@@ -4,6 +4,55 @@ Dated log of what was tried, what worked, and what broke — with numbers where 
 
 ---
 
+## 2026-08-31 — Day 4-5: SFT data prep + scripts (training run not yet executed)
+
+Approach and every hyperparameter choice: DECISIONS.md 2026-08-31. Fast-lane
+work (data-prep + training-script plumbing); no verifier or `reward.py` touched.
+
+### `sft/` delivered
+- `plan_prompt.py` — single source of truth for prompt/completion + downstream
+  reassembly (`reconstruct_plan`: templated metadata, `relations` derived from
+  openings, `audit=[]`).
+- `prepare_sft_data.py` — `data/processed/{split}.jsonl` → `sft/data/{split}.jsonl`
+  instruction pairs. Needs only `shapely`; runs locally.
+- `train_qlora.py` — plain one-command QLoRA script, wall-clock Drive
+  checkpointing, auto-resume, one status line per log step.
+- `eval_json_validity.py` — greedy decode over val, strict `json.loads` headline
+  rate + `geometry_gate` secondary, per-plan resumable output.
+- `requirements.txt` (pinned), `README.md` (verbatim Colab steps).
+
+### Data prep run (local, char-based estimate — exact tokens computed in Colab)
+`python sft/prepare_sft_data.py --splits train val`:
+
+| split | pairs written | prompt chars p50/p90 | completion chars p50/p90/p99/max | est. tokens p50/p90/p99 |
+|---|---|---|---|---|
+| train | 10,788 | 1434 / 1644 | 5023 / 6701 / 8283 / 25986 | 2305 / 2965 / 3583 |
+| val   | 1,349  | 1433 / 1634 | 5032 / 6557 / 8260 / 13874 | 2310 / 2902 / 3589 |
+
+At `max_seq_len=3072` the train-time filter is expected to drop ~8-9% of train
+pairs as over-length (exact % printed by `train_qlora.py` on the real tokenizer).
+The one 26k-char outlier is a jagged-traced-contour plan (see Day 3 phase B
+finding #2).
+
+### Roundtrip check (local)
+`build_completion_text` → `json.loads` → `reconstruct_plan` → `geometry_gate`:
+**401/401** first val plans PASS. `relations.derived` rebuilt from openings
+matches the converter's own list **401/401**. So the templated-downstream split
+is faithful — the model is not being asked to produce anything the pipeline
+can't deterministically restore.
+
+### Regression
+Full suite green: **110 passed** (`verifiers/tests/ rlvr/tests/ data/tests/`,
+pytest, Python 3.13.3, Shapely 2.1.2). No verifier / reward file modified.
+
+### Not done this session
+The actual QLoRA training run and the JSON-validity eval — both need the T4.
+Hyperparameters confirmed by user 2026-08-31. Next Colab session runs
+`train_qlora.py --calibrate 50` first (measured s/step → real full-run estimate,
+logged against the ~1 hr heuristic in DECISIONS.md) before the unattended run.
+
+---
+
 ## 2026-08-30 — Day 3 phase A: ResPlan dataset inspection (read-only)
 
 Switched data source RPLAN → ResPlan (see DECISIONS.md 2026-08-30). This session
