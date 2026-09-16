@@ -4,6 +4,232 @@ Dated log of every design choice and the reasoning behind it.
 
 ---
 
+## 2026-09-12 — PLACEHOLDER sampling config for reward-variance diagnostic (not the final GRPO rollout config)
+
+Checked for an existing GRPO rollout sampling decision before running the sampled-
+decoding reward-variance diagnostic (FINDINGS.md 2026-09-12). None exists —
+DECISIONS.md's only related note (2026-08-31, eval harness) is "greedy for
+reproducibility," which is about the JSON-validity eval, not GRPO rollouts.
+
+**Decision: used `temperature=0.8, top_p=0.9, top_k=0` (top-k disabled, top-p only)
+for this diagnostic's 4-samples/prompt generation, as an explicit placeholder.**
+This is a reasonable-default choice, not a tuned or validated one — it must be
+revisited when GRPO's actual rollout config is decided in Day 6-7, and that later
+decision is not bound by this placeholder.
+
+---
+
+## 2026-09-11 — Day 4-5: SFT training closed out (execution confirmation, no new decision)
+
+The `max_seq_len=5632`, continuous-execution plan decided on 2026-09-06 ran to
+completion without needing any of its contingencies: resume was never
+triggered (no crash/interruption occurred), and the two internet outages
+during the run only produced benign warnings (see FINDINGS.md 2026-09-11 for
+full numbers — final train loss 0.1993, final eval_loss 0.2035, ~4 day 23 h
+wall-clock). No decision to record here beyond confirming the 2026-09-06 plan
+held up as designed; this entry exists so DECISIONS.md's SFT thread has a
+clear closing marker before Day 4-5 moves to eval.
+
+**Open for a future decision, not resolved here**: eval harness configuration
+against `checkpoints/sft_qlora_5632/final` (JSON-validity / quality scoring)
+has not been started.
+
+---
+
+## 2026-09-06 — Day 4-5: final max_seq_len=5632, continuous execution, resume-crash patch
+
+### Final max_seq_len = 5632
+Chosen after a four-point measured sweep (3072 / 5120 / 5632 / 6144 — see
+FINDINGS.md 2026-09-06 and 2026-09-06 (cont'd) for the full retention-by-
+room-count tables, per-step timings, and the non-linear-slowdown
+investigation). Reasoning:
+- 3072 (original default): only 11.4% train retention, and undertrains
+  overwhelmingly on the small-room end (0% of 8-room plans kept) — rejected,
+  defeats the point of training on the project's own 5-8 room scope.
+- 4096: 59% aggregate retention hides a skew away from complex plans (only
+  38.2% of 7-room, 5.9% of 8-room kept) — rejected for the same reason as 3072,
+  just less severe.
+- 5120: good coverage (87.1% of 7-room, 58.7% of 8-room) at ~4.7 days
+  projected runtime — a viable candidate, but 5632 covers the complex end
+  better for a modest runtime cost.
+- **5632 (chosen)**: 95.05% overall retention, 95.8% of 7-room and 81.4% of
+  8-room plans kept — nearly matches 6144's near-complete coverage — at
+  ~5.76 days projected runtime (258.84 s/step, measured), vs. 6144's ~12.9
+  days (562 s/step, measured, disproportionately slower for reasons not
+  fully explained — see FINDINGS.md). 5632 is the point on the measured
+  curve that buys 6144-level room-count coverage without 6144's runtime
+  penalty.
+- 6144: rejected — best coverage (97.9%) but ~12.9 days projected, not
+  practical even under a "willing to accept longer" tolerance once 5632
+  captures nearly the same coverage for under half the time.
+
+### Execution mode: continuous, not scheduled daily chunks
+Superseded the plan flagged on 2026-09-06 (chunked daily runs, motivated by
+this being someone else's laptop and multi-day continuous full-load runs
+raising thermal/availability concerns). **New decision: the laptop is now
+dedicated to this project for the run's duration** — training will run
+continuously to completion (~5.76 days projected at max_seq_len=5632).
+Resume-safety is still required, but now purely as a crash/interruption
+safety net (power blip, forced OS update restart, accidental sleep), not for
+deliberate daily stopping. This changes what "prove resume works" needed to
+mean: an unplanned single interruption recovering correctly, not a
+resume-every-day workflow — see below, this was tested before committing to
+the continuous run.
+
+### Bug found and patched: torch 2.6 + transformers 4.46.3 resume crash
+Resume-proof test (real training, not `--calibrate`, at max_seq_len=5632):
+killed a short run after `checkpoint-3` (global_step=3), relaunched the
+identical command. It correctly printed `RESUMING from checkpoint-3` (auto-
+resume detection works) but then crashed:
+```
+_pickle.UnpicklingError: Weights only load failed ... Unsupported global:
+GLOBAL numpy._core.multiarray._reconstruct was not an allowed global by
+default.
+```
+Root cause: PyTorch 2.6 changed `torch.load`'s default from
+`weights_only=False` to `weights_only=True`. `transformers==4.46.3`'s
+`Trainer._load_rng_state` calls `torch.load(rng_file)` with no override, and
+the saved `rng_state.pth` contains numpy's legacy MT19937 RNG state (an
+ndarray), which needs specific globals allowlisted to unpickle under the
+strict default. Both of the versions in this collision (torch 2.6.0+cu124,
+transformers 4.46.3) are deliberately pinned, load-bearing decisions already
+made and verified: torch 2.6 for RTX 4050 (Ada/sm_89) + bitsandbytes
+0.45.5/Triton 3.2.0 compatibility (2026-09-05), transformers 4.46.3 as the
+original SFT stack pin (2026-08-31).
+
+**Decision: patch around it in `train_qlora.py`, not change either pinned
+version.** Rejected alternatives:
+- Downgrade torch below 2.6 — would revert the `weights_only` default (fixing
+  this natively) but reopens the RTX 4050/bitsandbytes/Triton compatibility
+  work from 2026-09-05, which would need re-verifying from scratch for no
+  reason related to this bug.
+- Upgrade transformers past 4.46.3 — might avoid the issue upstream, but
+  reopens the original 2026-08-31 pinned-stack verification (peft/accelerate
+  compatibility) for the same reason: unrelated to what's actually broken.
+
+Both alternatives fix a narrow unpickling restriction by re-litigating an
+unrelated, already-settled hardware/dependency decision. The patch touches
+only the one specific restriction actually causing the crash, and every file
+this affects (`rng_state.pth`, checkpoints in general) is written by this
+same script for itself — a fully trusted local source, so allowlisting is a
+safe, minimal fix.
+
+Implementation: `_allow_rng_state_unpickling()` in `train_qlora.py`, called
+early in `main()` before `set_seed()`. Calls
+`torch.serialization.add_safe_globals()` with four globals — found empirically
+by replaying an actual `rng_state.pth`'s unpickling one error at a time
+(`numpy._core.multiarray._reconstruct` alone, from the original error
+message, was not sufficient):
+`numpy._core.multiarray._reconstruct`, `numpy.ndarray`, `numpy.dtype`,
+`numpy.dtypes.UInt32DType`.
+
+**Verified fixed**: re-ran the resume-proof test from a clean checkpoint dir.
+Killed after `checkpoint-2` (global_step=2), relaunched, printed `RESUMING
+from checkpoint-2`, then continued training with no error through steps 3-4
+and wrote a fresh `checkpoint-4` (global_step=4, including a newly-written
+`rng_state.pth` — the save path isn't broken either, only the load path was).
+This is real continued progress, not just checkpoint detection — the first
+attempt also printed the correct `RESUMING` line and still crashed
+immediately after, so that line alone wasn't sufficient proof.
+
+---
+
+## 2026-09-05 — Day 4-5 continued: moved off Colab to local WSL/RTX 4050
+
+### Environment switch: Colab T4 → local WSL Ubuntu, RTX 4050 Laptop (6 GB VRAM)
+Continuing Day 4-5 locally instead of waiting on a Colab session. This is a
+smaller GPU than the T4 the scripts/hyperparameters were tuned for (6 GB vs.
+16 GB), so every VRAM-sensitive default needed re-checking against real
+measurements rather than assumed to carry over. Findings below.
+
+### Dependency deviations from `sft/requirements.txt` (local-only)
+The venv had only `pip` installed — none of `sft/requirements.txt` was actually
+present despite it being expected to be, so every package below was installed
+fresh, not just `shapely`:
+- **`shapely`** (latest, 2.1.2) — for `data/run.py`; no version conflict.
+- **`torch` — not pinned in `sft/requirements.txt` by design** ("whatever Colab
+  preinstalls; do NOT reinstall"), but there is no Colab preinstall locally.
+  Installed **torch 2.6.0+cu124** (CUDA 12.4 build) — required for the RTX 4050
+  Laptop's Ada Lovelace architecture (compute capability sm_89); driver reports
+  CUDA 13.0 capability so cu124 is safely within range. This is a genuinely new
+  requirement for local runs, not a version bump of an existing pin.
+- **`transformers==4.46.3`, `peft==0.13.2`, `accelerate==1.1.1`, `datasets==3.1.0`**
+  — installed exactly as pinned, imported cleanly together.
+- **`jinja2`** (unpinned dependency, not listed) — `transformers` 4.46.3's
+  `apply_chat_template` requires it and it was missing; installed latest (3.1.6).
+  Should be added to `sft/requirements.txt` as an explicit dependency rather than
+  relying on it being pulled in transitively.
+- **`bitsandbytes` bumped 0.44.1 → 0.45.5 (deviation, required)**. 0.44.1 fails
+  to import against torch 2.6.0's bundled Triton (3.2.0): its
+  `nn/triton_based_modules.py` imports `triton.ops.matmul_perf_model`, an API
+  removed in Triton ≥3.1. This is a hard incompatibility, not a soft warning —
+  bitsandbytes did not import at all. 0.45.5 (next minor line) imports and runs
+  cleanly against torch 2.6.0+cu124 with no other API changes hit. Confirmed
+  compatible with the pinned transformers/peft/accelerate via `--calibrate 50`
+  (below) completing without error.
+
+### Batch size / gradient accumulation: already at the floor for 6 GB
+Checked `train_qlora.py` defaults before running anything, per the plan.
+`per_device_batch_size=1`, `grad_accum=16`, 4-bit NF4 quant,
+`prepare_model_for_kbit_training(use_gradient_checkpointing=True)`, and
+`optim=paged_adamw_8bit` are already the T4 defaults (comment at the original
+2026-08-31 entry: "batch=1 forced by seq-len 3072 on a T4"). There is **no
+smaller batch size to propose** — 1 is the floor, and `grad_accum` only changes
+effective batch size / step count, not peak VRAM. For a 6 GB card the only
+remaining VRAM levers are `max_seq_len`, LoRA rank/target-module count, or
+accepting the OOM risk and letting calibration measure it directly — which is
+what was done instead of guessing. Decision: **left batch/grad-accum
+unchanged**; `--calibrate 50` (below) is the actual VRAM test.
+
+### Calibration result (measured on RTX 4050 Laptop, 6 GB, NOT the T4)
+`python sft/train_qlora.py --output-dir ./checkpoints/sft_qlora --calibrate 50`:
+- **No OOM.** Peak VRAM ~5.5–5.6 GB / 6.1 GB (≈500–600 MB headroom; ~1.65 GB of
+  the 6.1 GB is already reserved by the desktop/display compositor at idle, so
+  the training process itself used roughly 3.9 GB). Held steady across 50 steps.
+- **123.374 s/step** (median of 44 steps, first 5 skipped for warmup) at
+  `max_seq_len=3072`, batch 1 × grad_accum 16.
+- Full run at the *filtered* dataset size (see below): 234 optimiser steps ⇒
+  **~8:25–8:58 (h:mm) wall-clock**, vs. the **~1 hr T4 heuristic** on record
+  from 2026-08-31. This is not a small miss — roughly **8-9× slower** than
+  planned. Plausible cause: this workload (4-bit dequant per layer + gradient-
+  checkpointing recompute, batch=1) is memory-bandwidth-bound, and a 6 GB
+  laptop GPU has both lower memory bandwidth and a shared power/thermal budget
+  with the CPU compared to a dedicated datacenter T4 sustaining its rated
+  clock — not verified against T4 hardware here, just the most likely
+  explanation. **Flagged for user decision, not started**: an unattended
+  8.5–9 hour local run is a materially different commitment than the original
+  plan and needs explicit confirmation, separate from the VRAM question.
+
+### max_seq_len=3072 drop rate: measured is ~10× the 2026-08-31 estimate
+`prepare_sft_data.py --tokenizer Qwen/Qwen2.5-1.5B-Instruct --max-seq-len 3072`
+on the real tokenizer: train exact-token p50=3897, p90=5210 (vs. the chars/2.8
+heuristic's p50≈2305, p90≈2965 on record from 2026-08-31) — **88.55% of train
+pairs (9,553 / 10,788) and 89.03% of val pairs are dropped**, not the
+estimated ~8-9%. `train_qlora.py --calibrate` independently confirms this on
+its own tokenization pass (kept 1,235 / 10,788 train, 35 / 256 eval subset).
+
+Root cause: the chars/2.8 heuristic was calibrated for prose-like text; this
+completion is coordinate-heavy JSON (6-dp metre floats), and BPE tokenizers
+split long digit runs far less efficiently than English text — real ratio here
+is closer to ~1.6-1.7 chars/token, not 2.8. This was not caught earlier because
+the 2026-08-31 estimate was explicitly logged as provisional pending "the exact
+Qwen tokenizer in Colab" — that step has now happened, just locally instead.
+
+**Consequence, not yet resolved**: at `max_seq_len=3072` the effective SFT
+train set is ~1,235 plans (11.4% of the intended 10,788), skewed toward the
+smallest/shortest plans in the 5-8-room scope — a much narrower and more
+biased sample than the "~91% kept" the original design assumed. Raising
+`max_seq_len` directly worsens both the VRAM headroom (already thin, above)
+and the 123 s/step calibration number (longer sequences cost more per step),
+so this is not a free fix. **Flagged for user decision**: options are (a)
+accept the ~1,235-example subset for this SFT pass, (b) raise `max_seq_len`
+(quantify the new VRAM/time cost first), or (c) reduce completion token cost
+(e.g. coordinate precision — previously rejected on 2026-08-31 because it
+breaks `geometry_gate`'s tolerance in training targets, so this would need
+re-litigating, not silently redone). Not decided here.
+
+---
+
 ## 2026-08-31 — Day 4-5: SFT (QLoRA) — data split, base model, hyperparameters
 
 ### PROJECT_CONTEXT.md committed to the repo
@@ -120,7 +346,10 @@ band), writing `calibration.json`. The Colab flow runs calibration **before**
 the unattended run; the measured number goes here next to this heuristic,
 whichever way it lands. On record now:
 - **heuristic estimate:** ~1 hr for 3 epochs (~1,875 steps, assumed ~2 s/step).
-- **measured estimate:** _pending first Colab calibration._
+- **measured estimate:** see 2026-09-05 entry above — 123.374 s/step measured
+  locally on an RTX 4050 Laptop (not the T4 this heuristic assumed), projecting
+  ~8:25–8:58 for a 3-epoch run on the max_seq_len-filtered set. ~8-9× the
+  heuristic; not yet run on an actual T4 for comparison.
 
 ### Training run status
 **Not yet executed.** Hyperparameters confirmed by user 2026-08-31. Scripts +

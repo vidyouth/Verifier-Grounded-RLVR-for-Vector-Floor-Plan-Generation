@@ -85,11 +85,15 @@ vertex-count cap or simplification before egress is advisable at scale.
   cannot train a 7-8B QLoRA in scope, so the policy is Qwen2.5-1.5B-Instruct
   (logged decision, DECISIONS.md 2026-08-31). Any generation-quality ceiling
   from model size applies to every downstream result (SFT and GRPO).
-- **`max_seq_len = 3072` drops the long tail of plans.** ~8-9% of in-scope train
-  plans exceed the budget and are dropped (not truncated). These skew toward the
-  largest / most jagged-contour layouts, so the SFT model is trained on the
-  smaller-plan end of the 5-8-room distribution. Same cap applies at eval-time
-  generation.
+- **`max_seq_len = 3072` drops the large majority of plans, not a long tail.**
+  Original estimate (2026-08-31, chars/2.8 heuristic): ~8-9%. **Measured on the
+  real Qwen2.5-1.5B-Instruct tokenizer (2026-09-05): 88.55% of train / 89.03%
+  of val pairs exceed the budget and are dropped** (not truncated) — the
+  heuristic badly underestimated tokens-per-char for coordinate-heavy JSON.
+  Effective train set at this cap is ~1,235 of 10,788 plans, skewed toward the
+  smallest layouts in the 5-8-room scope. This is an open decision
+  (DECISIONS.md 2026-09-05), not yet resolved — SFT has not been run on this
+  filtered set at scale.
 - **`metadata`, `relations`, `audit` are not model outputs.** They are templated
   or derived from `openings` after generation. The SFT model is never evaluated
   on its ability to produce them, and any downstream "schema completeness" claim
@@ -103,6 +107,37 @@ vertex-count cap or simplification before egress is advisable at scale.
   breaks `geometry_gate`'s endpoint-on-wall tolerance in the training targets.
 - **CORR-W-01 remains vacuous** on this data (inherited from the ResPlan
   conversion — see above). SFT does not change that.
+- **Training compute is hardware-dependent and not yet validated on the T4
+  this plan assumed.** Measured locally (2026-09-05) on an RTX 4050 Laptop
+  (6 GB VRAM): 123.374 s/step, projecting ~8:25–8:58 for a 3-epoch run — ~8-9×
+  the ~1 hr T4 heuristic on record from 2026-08-31. No OOM at this GPU's 6 GB,
+  but headroom was thin (~500-600 MB free at peak). Any runtime or feasibility
+  claim in this project should specify which hardware it was measured on.
+
+## SFT completion truncation — forward-flag for Day 6-7 GRPO (added 2026-09-12)
+
+The Day 4-5 JSON-validity eval (300-plan random val sample, FINDINGS.md
+2026-09-11/12) found that **99.4% of invalid completions (158/159) are
+truncated, not malformed** — the model hits the `max_new_tokens=5632` budget
+before emitting EOS, and this is sharply room-count-correlated (100% of
+5/7/8-room invalid completions are truncation; 8-room plans have the lowest
+overall valid_json rate at 34.0%). Only 1/300 completions were genuinely
+malformed JSON.
+
+**GRPO rollouts will hit this same wall**, especially on 7-8-room plans, since
+rollout generation uses the same base model/tokenizer and produces the same
+coordinate-heavy JSON. Two consequences for the reward function
+(`rlvr/reward.py`) and rollout config, not yet implemented:
+- **Rollout `max_new_tokens` must be sufficiently generous** — reusing 5632
+  as-is would reproduce this truncation rate inside training, not just at
+  eval time.
+- **The reward function must treat truncation as distinct from a genuine
+  clause violation**, not fold both into the same penalty. A truncated
+  completion is missing information (incomplete JSON), not a plan that was
+  fully generated and then measured as non-compliant — conflating the two
+  would teach the policy the wrong thing (either overpenalizing near-complete
+  long plans, or making truncation and real geometric failure
+  indistinguishable in the training signal).
 
 ## Within-room convexity approximation (egress.py)
 

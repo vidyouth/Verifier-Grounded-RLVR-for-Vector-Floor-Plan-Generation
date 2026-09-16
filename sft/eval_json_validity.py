@@ -43,9 +43,9 @@ def _plan_id(plan: dict) -> int:
     return int(plan.get("metadata", {}).get("source", {}).get("plan_id", -1))
 
 
-def _load_val(limit: int = 0) -> list[dict]:
+def _load_val(limit: int = 0, val_path: Path = _VAL) -> list[dict]:
     rows = []
-    with _VAL.open(encoding="utf-8") as fh:
+    with val_path.open(encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if line:
@@ -78,7 +78,12 @@ def _score_generation(text: str) -> dict:
     try:
         plan = reconstruct_plan(obj)
         res["geometry_gate_pass"] = bool(geometry_gate.check(plan)["pass"])
-    except (KeyError, TypeError, ValueError) as e:
+    except Exception as e:
+        # Broad on purpose: a model-generated plan with valid JSON but invalid/
+        # self-intersecting polygons can raise shapely.errors.GEOSException (not a
+        # ValueError) inside geometry_gate's shapely calls. That is a legitimate
+        # geometry_gate_pass=False outcome, not a crash-worthy condition — record it
+        # and keep scoring the rest of the val set.
         res["note"] = f"reconstruct/gate error: {type(e).__name__}"
     return res
 
@@ -88,9 +93,13 @@ def main() -> None:
     ap.add_argument("--adapter", required=True, help="path to the trained LoRA adapter (…/final)")
     ap.add_argument("--base-model", default="Qwen/Qwen2.5-1.5B-Instruct")
     ap.add_argument("--out", default=None, help="results JSONL (default: <adapter>/../eval_json_validity.jsonl)")
+    ap.add_argument("--val", default=str(_VAL), help="val-style JSONL to score (default: data/processed/val.jsonl)")
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--max-new-tokens", type=int, default=3200)
     ap.add_argument("--limit", type=int, default=0, help="score only the first N val plans (dev)")
+    ap.add_argument("--save-raw-text", action="store_true",
+                     help="also persist the raw decoded completion text per plan (diagnostic use, "
+                          "e.g. reward-function analysis on already-generated outputs)")
     args = ap.parse_args()
 
     import torch
@@ -112,7 +121,7 @@ def main() -> None:
                     pass
         print(f"resume: {len(done)} plans already scored in {out_path}")
 
-    rows = _load_val(limit=args.limit)
+    rows = _load_val(limit=args.limit, val_path=Path(args.val))
     todo = [p for p in rows if _plan_id(p) not in done]
     print(f"val plans: {len(rows)}  |  to generate: {len(todo)}")
     if not todo:
@@ -149,8 +158,23 @@ def main() -> None:
                 )
             new = gen[:, enc["input_ids"].shape[1]:]
             texts = tok.batch_decode(new, skip_special_tokens=True)
-            for plan, text in zip(chunk, texts):
-                rec = {"plan_id": _plan_id(plan), **_score_generation(text)}
+            for plan, text, row in zip(chunk, texts, new):
+                # eos_token_id (151645) != pad_token_id (151643) for this tokenizer, so a
+                # row with no eos anywhere ran the full --max-new-tokens without finishing
+                # ("hit_max_new_tokens" = truncated by budget, not a model failure).
+                eos_positions = (row == tok.eos_token_id).nonzero(as_tuple=True)[0]
+                hit_cap = eos_positions.numel() == 0
+                gen_token_count = int(eos_positions[0].item()) + 1 if not hit_cap else row.shape[0]
+                n_rooms = sum(1 for r in plan.get("rooms", []) if r.get("type") != "balcony")
+                rec = {
+                    "plan_id": _plan_id(plan),
+                    **_score_generation(text),
+                    "hit_max_new_tokens": hit_cap,
+                    "gen_token_count": gen_token_count,
+                    "n_rooms": n_rooms,
+                }
+                if args.save_raw_text:
+                    rec["raw_text"] = text
                 out.write(json.dumps(rec, ensure_ascii=False) + "\n")
             out.flush()
             n_done = min(i + args.batch_size, len(todo))

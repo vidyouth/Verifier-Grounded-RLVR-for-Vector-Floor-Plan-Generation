@@ -298,6 +298,29 @@ def _latest_checkpoint(output_dir: Path):
     return str(max(cks, key=lambda p: int(p.name.split("-")[1])))
 
 
+def _allow_rng_state_unpickling() -> None:
+    """
+    torch>=2.6 defaults torch.load(weights_only=True); transformers==4.46.3's
+    Trainer._load_rng_state calls torch.load(rng_file) with no override, and the
+    saved rng_state.pth contains numpy's legacy MT19937 state array, which needs
+    these four globals allowlisted to unpickle under the strict default. All
+    files this loads are checkpoints this same script just wrote — a trusted
+    local source, so allowlisting is safe (found empirically 2026-09-06 by
+    replaying an rng_state.pth's unpickling errors one at a time; see
+    DECISIONS.md same date for why this is a patch, not a torch/transformers
+    version change).
+    """
+    import numpy as np
+    from torch.serialization import add_safe_globals
+
+    add_safe_globals([
+        np._core.multiarray._reconstruct,
+        np.ndarray,
+        np.dtype,
+        np.dtypes.UInt32DType,
+    ])
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -315,6 +338,7 @@ def main() -> None:
         set_seed,
     )
 
+    _allow_rng_state_unpickling()
     set_seed(cfg.seed)
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
